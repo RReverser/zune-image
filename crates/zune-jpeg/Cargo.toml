@@ -29,7 +29,9 @@ default = ["x86", "neon", "std"]
 
 
 [dependencies]
-zune-core = { path = "../zune-core", version = "0.5.1" }
+# From crates.io, so that a project that patches in this crate by path shares its `zune-core`
+# with the other crates of that project.
+zune-core = "0.5.1"
 
 
 [dev-dependencies]
