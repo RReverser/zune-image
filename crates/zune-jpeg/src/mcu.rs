@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use core::cmp::min;
+use core::ops::Range;
 
 use zune_core::bytestream::ZByteReaderTrait;
 use zune_core::colorspace::ColorSpace;
@@ -84,9 +85,26 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         clippy::too_many_lines,
         clippy::cast_possible_truncation
     )]
-    #[inline(never)]
     pub(crate) fn decode_mcu_ycbcr_baseline(
         &mut self, pixels: &mut [u8]
+    ) -> Result<(), DecodeErrors> {
+        self.decode_mcu_ycbcr_baseline_with(pixels, &mut |_, _| {})
+    }
+
+    /// Decode MCUs like [`decode_mcu_ycbcr_baseline`](Self::decode_mcu_ycbcr_baseline), and hand
+    /// each band of output rows to `on_rows` as soon as it is final.
+    ///
+    /// Post-processing writes the output rows in order, so after each row of MCUs every row
+    /// before `pixels_written` is final. That band is split off the front of the remaining
+    /// output, which is why the rows can be handed over for the whole lifetime of `pixels`.
+    #[allow(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation
+    )]
+    #[inline(never)]
+    pub(crate) fn decode_mcu_ycbcr_baseline_with<'a>(
+        &mut self, pixels: &'a mut [u8], on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -184,6 +202,12 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
+        // The output that is not handed over yet, and how many of its bytes are written.
+        let mut bands = Bands {
+            rest: pixels,
+            first_row: 0,
+            row_bytes: width * self.options.jpeg_get_out_colorspace().num_components()
+        };
         let mut pixels_written = 0;
 
         let is_hv = usize::from(self.is_interleaved);
@@ -200,7 +224,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
             for i in 0..mcu_height {
                 if stream.overread_by > 0 {
-                    pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                    bands.rest.get_mut(pixels_written..).map(|v| v.fill(128));
                     if self.options.strict_mode() {
                         return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
                     };
@@ -250,7 +274,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // full components, which we skipped earlier.
                 if all_components_in_first_scan {
                     self.post_process(
-                        pixels,
+                        bands.rest,
                         i,
                         mcu_height,
                         width,
@@ -258,12 +282,15 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         &mut pixels_written,
                         &mut upsampler_scratch_space
                     )?;
+                    bands.hand_over(pixels_written, on_rows);
+                    pixels_written = 0;
                 }
 
                 match terminate {
                     McuContinuation::Ok => {}
                     McuContinuation::AnotherSos if all_components_in_first_scan => {
                         warn!("More than one SOS despite already having all components");
+                        bands.hand_over_rest(on_rows);
                         return Ok(());
                     }
                     McuContinuation::AnotherSos => continue 'sos,
@@ -279,7 +306,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate => {
                         warn!("Got terminate signal, will not process further");
-                        pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                        bands.rest.get_mut(pixels_written..).map(|v| v.fill(128));
+                        bands.hand_over_rest(on_rows);
                         return Ok(());
                     }
                 }
@@ -291,7 +319,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         if !all_components_in_first_scan {
-            self.finish_baseline_decoding(&progressive_mcus, mcu_width, pixels)?;
+            self.finish_baseline_decoding(&progressive_mcus, mcu_width, bands.rest)?;
         }
 
         // it may happen that some images don't have the whole buffer
@@ -316,6 +344,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         trace!("Finished decoding image");
 
+        bands.hand_over_rest(on_rows);
         Ok(())
     }
 
@@ -944,6 +973,34 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         *pixels_written = px;
         Ok(())
+    }
+}
+
+/// The part of the output of a decoding that is not handed over yet.
+struct Bands<'a> {
+    rest: &'a mut [u8],
+    /// The output row that `rest` starts with.
+    first_row: usize,
+    /// The bytes of one output row.
+    row_bytes: usize
+}
+
+impl<'a> Bands<'a> {
+    /// Hands the first `len` bytes of `rest`, which hold whole rows, to `on_rows`.
+    fn hand_over(&mut self, len: usize, on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])) {
+        if len == 0 {
+            return;
+        }
+        let (band, rest) = core::mem::take(&mut self.rest).split_at_mut(len);
+        let rows = len / self.row_bytes.max(1);
+        on_rows(self.first_row..self.first_row + rows, band);
+        self.first_row += rows;
+        self.rest = rest;
+    }
+
+    /// Hands all of `rest` to `on_rows`.
+    fn hand_over_rest(&mut self, on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])) {
+        self.hand_over(self.rest.len(), on_rows);
     }
 }
 

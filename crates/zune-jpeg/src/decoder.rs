@@ -845,6 +845,61 @@ where
         }
     }
 
+    /// Decode into a pre-allocated buffer like [`decode_into`](Self::decode_into), and hand
+    /// over each band of rows as soon as its pixels are final.
+    ///
+    /// `on_rows` is called with the range of output rows that a band covers and the bytes of
+    /// those rows, in the order of the rows, until every row of the image has been handed
+    /// over once. The band is split off `out`, so the caller may keep it for the lifetime of
+    /// `out`, for example to process it on another thread while the rest is decoded.
+    ///
+    /// A sequential image hands over its rows after each row of MCUs, which is 8 or 16 rows of
+    /// the image, except where a row of MCUs completes the previous one as well. A progressive
+    /// image, or a sequential one whose components are in separate scans, is complete only
+    /// after the last scan, and hands over all its rows at once. The rows that a corrupt image
+    /// does not reach are filled as `decode_into` fills them and handed over at the end.
+    ///
+    /// On an error, the rows handed over so far are final and the others are not handed over.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use zune_core::bytestream::ZCursor;
+    /// use zune_jpeg::JpegDecoder;
+    /// let mut decoder = JpegDecoder::new(ZCursor::new(&[]));
+    /// decoder.decode_headers().unwrap();
+    ///
+    /// let mut out = vec![0; decoder.output_buffer_size().unwrap()];
+    /// let mut bands = vec![];
+    /// decoder
+    ///     .decode_into_with(&mut out, |rows, band| bands.push((rows, band)))
+    ///     .unwrap();
+    /// ```
+    pub fn decode_into_with<'a>(
+        &mut self, out: &'a mut [u8], mut on_rows: impl FnMut(core::ops::Range<usize>, &'a mut [u8])
+    ) -> Result<(), DecodeErrors> {
+        self.decode_headers_internal()?;
+
+        let expected_size = self.output_buffer_size().unwrap();
+
+        if out.len() < expected_size {
+            // too small of a size
+            return Err(DecodeErrors::TooSmallOutput(expected_size, out.len()));
+        }
+
+        // ensure we don't touch anyone else's scratch space
+        let out = &mut out[0..expected_size];
+
+        if self.is_progressive {
+            self.decode_mcu_ycbcr_progressive(out)?;
+            let rows = usize::from(self.info.height);
+            on_rows(0..rows, out);
+            Ok(())
+        } else {
+            self.decode_mcu_ycbcr_baseline_with(out, &mut on_rows)
+        }
+    }
+
     /// Read only headers from a jpeg image buffer
     ///
     /// This allows you to extract important information like
