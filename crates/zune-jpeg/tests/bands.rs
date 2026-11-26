@@ -6,7 +6,8 @@
  * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
  */
 
-//! Tests for `decode_into_with`, which hands over bands of rows during the decoding.
+//! Tests for `decode_into_with` and `decode_stripes_with`, which hand over bands of rows during
+//! the decoding.
 
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -52,7 +53,55 @@ fn assert_bands_match_decode(data: &[u8], colorspace: ColorSpace) -> usize {
         "the bands cover the image"
     );
     assert_eq!(out, expected);
+    assert_stripes_match_decode(data, colorspace, &expected);
     bands.len()
+}
+
+/// Decodes `data` with `decode_stripes_with` and checks that the stripes cover every row once,
+/// in order, and hold the pixels `expected` that `decode` returns. Every other stripe takes the
+/// buffer, so that the decoder writes both into the buffer it handed over and into a new one.
+fn assert_stripes_match_decode(data: &[u8], colorspace: ColorSpace, expected: &[u8]) {
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(colorspace);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    decoder.decode_headers().unwrap();
+    let info = decoder.info().unwrap();
+    let row_bytes = usize::from(info.width) * colorspace.num_components();
+    let mut stripes = vec![];
+    decoder
+        .decode_stripes_with(|rows, stripe| {
+            if stripes.len() % 2 == 0 {
+                stripes.push((rows, std::mem::take(stripe)));
+            } else {
+                stripes.push((rows, stripe.clone()));
+            }
+        })
+        .unwrap();
+
+    let mut next_row = 0;
+    for (rows, stripe) in &stripes {
+        assert_eq!(
+            rows.start, next_row,
+            "the stripes are in order and leave no gap"
+        );
+        assert!(!rows.is_empty(), "a stripe holds rows");
+        assert!(rows.len() <= 36, "a stripe holds a row of MCUs at most");
+        assert_eq!(
+            stripe.len(),
+            rows.len() * row_bytes,
+            "a stripe holds its rows"
+        );
+        assert_eq!(
+            stripe[..],
+            expected[rows.start * row_bytes..rows.end * row_bytes],
+            "rows {rows:?}"
+        );
+        next_row = rows.end;
+    }
+    assert_eq!(
+        next_row,
+        usize::from(info.height),
+        "the stripes cover the image"
+    );
 }
 
 #[test]

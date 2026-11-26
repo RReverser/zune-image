@@ -97,14 +97,35 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     /// Post-processing writes the output rows in order, so after each row of MCUs every row
     /// before `pixels_written` is final. That band is split off the front of the remaining
     /// output, which is why the rows can be handed over for the whole lifetime of `pixels`.
+    pub(crate) fn decode_mcu_ycbcr_baseline_with<'a>(
+        &mut self, pixels: &'a mut [u8], on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])
+    ) -> Result<(), DecodeErrors> {
+        let row_bytes =
+            usize::from(self.info.width) * self.options.jpeg_get_out_colorspace().num_components();
+        self.decode_mcu_ycbcr_baseline_into(&mut Bands {
+            rest: pixels,
+            first_row: 0,
+            row_bytes,
+            on_rows
+        })
+    }
+
+    /// Decode MCUs like [`decode_mcu_ycbcr_baseline`](Self::decode_mcu_ycbcr_baseline) into
+    /// the output that `out` gives for each row of MCUs, and hand the rows over to `out` once
+    /// they are final.
+    ///
+    /// Post-processing only writes the output rows, in order: it reads the samples of the
+    /// components, and keeps the rows that vertical upsampling needs from the previous row of
+    /// MCUs in the components. So a row of MCUs needs no output rows of an earlier one, and the
+    /// output of each row of MCUs can be a buffer of its own.
     #[allow(
         clippy::similar_names,
         clippy::too_many_lines,
         clippy::cast_possible_truncation
     )]
     #[inline(never)]
-    pub(crate) fn decode_mcu_ycbcr_baseline_with<'a>(
-        &mut self, pixels: &'a mut [u8], on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])
+    pub(crate) fn decode_mcu_ycbcr_baseline_into(
+        &mut self, out: &mut dyn RowSink
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -154,6 +175,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
         let width = usize::from(self.info.width);
 
+        // A row of MCUs writes at most `8 * v * coeff` rows of its own, and with vertical
+        // upsampling also the last `v * coeff` rows of the previous one, which need its samples.
+        let v = match self.info.sample_ratio {
+            SampleRatios::Generic(_, v) => v.max(self.v_max),
+            _ => self.v_max
+        };
+        out.set_mcu_row_rows(9 * v * self.coeff);
+
         let padded_width = calculate_padded_width(width, self.info.sample_ratio);
 
         let mut stream = BitStream::new();
@@ -202,14 +231,6 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
-        // The output that is not handed over yet, and how many of its bytes are written.
-        let mut bands = Bands {
-            rest: pixels,
-            first_row: 0,
-            row_bytes: width * self.options.jpeg_get_out_colorspace().num_components()
-        };
-        let mut pixels_written = 0;
-
         let is_hv = usize::from(self.is_interleaved);
         let upsampler_scratch_size = is_hv * self.components.iter().map(|x| x.width_stride).max().unwrap_or(0) * 8;
         let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
@@ -224,7 +245,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
             for i in 0..mcu_height {
                 if stream.overread_by > 0 {
-                    bands.rest.get_mut(pixels_written..).map(|v| v.fill(128));
+                    out.fill_rest(128);
                     if self.options.strict_mode() {
                         return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
                     };
@@ -273,8 +294,9 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // process that width up until it's impossible. This is faster than allocation the
                 // full components, which we skipped earlier.
                 if all_components_in_first_scan {
+                    let mut pixels_written = 0;
                     self.post_process(
-                        bands.rest,
+                        out.mcu_row_output(),
                         i,
                         mcu_height,
                         width,
@@ -282,15 +304,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         &mut pixels_written,
                         &mut upsampler_scratch_space
                     )?;
-                    bands.hand_over(pixels_written, on_rows);
-                    pixels_written = 0;
+                    out.hand_over(pixels_written);
                 }
 
                 match terminate {
                     McuContinuation::Ok => {}
                     McuContinuation::AnotherSos if all_components_in_first_scan => {
                         warn!("More than one SOS despite already having all components");
-                        bands.hand_over_rest(on_rows);
+                        out.hand_over_rest();
                         return Ok(());
                     }
                     McuContinuation::AnotherSos => continue 'sos,
@@ -306,8 +327,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate => {
                         warn!("Got terminate signal, will not process further");
-                        bands.rest.get_mut(pixels_written..).map(|v| v.fill(128));
-                        bands.hand_over_rest(on_rows);
+                        out.fill_rest(128);
+                        out.hand_over_rest();
                         return Ok(());
                     }
                 }
@@ -319,7 +340,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         if !all_components_in_first_scan {
-            self.finish_baseline_decoding(&progressive_mcus, mcu_width, bands.rest)?;
+            self.finish_baseline_decoding(&progressive_mcus, mcu_width, out.rest())?;
         }
 
         // it may happen that some images don't have the whole buffer
@@ -344,7 +365,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         trace!("Finished decoding image");
 
-        bands.hand_over_rest(on_rows);
+        out.hand_over_rest();
         Ok(())
     }
 
@@ -976,31 +997,157 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 }
 
-/// The part of the output of a decoding that is not handed over yet.
-struct Bands<'a> {
-    rest: &'a mut [u8],
+/// Where the baseline decoder writes its output rows, and to whom it hands them once they are
+/// final. The rows are handed over in order, each once.
+pub(crate) trait RowSink {
+    /// Says how many output rows one row of MCUs writes at most.
+    fn set_mcu_row_rows(&mut self, rows: usize);
+    /// The output for the next row of MCUs, which post-processing writes from its start.
+    fn mcu_row_output(&mut self) -> &mut [u8];
+    /// Hands over the first `len` bytes of the output of the row of MCUs, which hold whole rows.
+    fn hand_over(&mut self, len: usize);
+    /// Fills the rows that are not handed over yet with `value`.
+    fn fill_rest(&mut self, value: u8);
+    /// The output of all the rows that are not handed over yet, for a decoding that writes them
+    /// at once.
+    fn rest(&mut self) -> &mut [u8];
+    /// Hands over all the rows that are not handed over yet.
+    fn hand_over_rest(&mut self);
+}
+
+/// The part of the output buffer of a decoding that is not handed over yet. Each band is split
+/// off the front of the buffer.
+struct Bands<'a, 'f> {
+    rest:      &'a mut [u8],
     /// The output row that `rest` starts with.
     first_row: usize,
     /// The bytes of one output row.
-    row_bytes: usize
+    row_bytes: usize,
+    on_rows:   &'f mut dyn FnMut(Range<usize>, &'a mut [u8])
 }
 
-impl<'a> Bands<'a> {
-    /// Hands the first `len` bytes of `rest`, which hold whole rows, to `on_rows`.
-    fn hand_over(&mut self, len: usize, on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])) {
+impl RowSink for Bands<'_, '_> {
+    fn set_mcu_row_rows(&mut self, _rows: usize) {}
+
+    fn mcu_row_output(&mut self) -> &mut [u8] {
+        &mut *self.rest
+    }
+
+    fn hand_over(&mut self, len: usize) {
         if len == 0 {
             return;
         }
         let (band, rest) = core::mem::take(&mut self.rest).split_at_mut(len);
         let rows = len / self.row_bytes.max(1);
-        on_rows(self.first_row..self.first_row + rows, band);
+        (self.on_rows)(self.first_row..self.first_row + rows, band);
         self.first_row += rows;
         self.rest = rest;
     }
 
-    /// Hands all of `rest` to `on_rows`.
-    fn hand_over_rest(&mut self, on_rows: &mut dyn FnMut(Range<usize>, &'a mut [u8])) {
-        self.hand_over(self.rest.len(), on_rows);
+    fn fill_rest(&mut self, value: u8) {
+        self.rest.fill(value);
+    }
+
+    fn rest(&mut self) -> &mut [u8] {
+        &mut *self.rest
+    }
+
+    fn hand_over_rest(&mut self) {
+        self.hand_over(self.rest.len());
+    }
+}
+
+/// The output of a decoding that holds one stripe of rows at a time, and hands each stripe over
+/// in the same buffer.
+pub(crate) struct Stripes<'f> {
+    /// The buffer of the stripe that is being written.
+    stripe:      Vec<u8>,
+    /// The output of all the rows that are not handed over yet, for a decoding that writes them
+    /// at once. Empty otherwise.
+    whole:       Vec<u8>,
+    /// The value of the rows that the decoding does not reach.
+    fill:        u8,
+    /// The output row that the next stripe starts with.
+    first_row:   usize,
+    height:      usize,
+    /// The bytes of one output row.
+    row_bytes:   usize,
+    /// The rows of a stripe at most.
+    stripe_rows: usize,
+    on_rows:     &'f mut dyn FnMut(Range<usize>, &mut Vec<u8>)
+}
+
+impl<'f> Stripes<'f> {
+    pub(crate) fn new(
+        height: usize, row_bytes: usize, on_rows: &'f mut dyn FnMut(Range<usize>, &mut Vec<u8>)
+    ) -> Self {
+        Self {
+            stripe: Vec::new(),
+            whole: Vec::new(),
+            fill: 0,
+            first_row: 0,
+            height,
+            row_bytes,
+            stripe_rows: 8,
+            on_rows
+        }
+    }
+
+    /// The rows that are not handed over yet.
+    fn rows_left(&self) -> usize {
+        self.height - self.first_row
+    }
+
+    /// Hands over the stripe buffer, which holds `rows` rows.
+    fn hand_over_stripe(&mut self, rows: usize) {
+        self.stripe.truncate(rows * self.row_bytes);
+        (self.on_rows)(self.first_row..self.first_row + rows, &mut self.stripe);
+        self.first_row += rows;
+    }
+}
+
+impl RowSink for Stripes<'_> {
+    fn set_mcu_row_rows(&mut self, rows: usize) {
+        self.stripe_rows = rows.max(1);
+    }
+
+    fn mcu_row_output(&mut self) -> &mut [u8] {
+        let rows = min(self.stripe_rows, self.rows_left());
+        self.stripe.resize(rows * self.row_bytes, 0);
+        &mut self.stripe
+    }
+
+    fn hand_over(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.hand_over_stripe(len / self.row_bytes.max(1));
+    }
+
+    fn fill_rest(&mut self, value: u8) {
+        self.fill = value;
+        self.whole.fill(value);
+    }
+
+    fn rest(&mut self) -> &mut [u8] {
+        if self.whole.is_empty() {
+            self.whole = vec![self.fill; self.rows_left() * self.row_bytes];
+        }
+        &mut self.whole
+    }
+
+    fn hand_over_rest(&mut self) {
+        let whole = core::mem::take(&mut self.whole);
+        let mut whole_rows = whole.chunks(self.stripe_rows * self.row_bytes.max(1));
+        while self.rows_left() > 0 && self.row_bytes > 0 {
+            let rows = min(self.stripe_rows, self.rows_left());
+            self.stripe.clear();
+            match whole_rows.next() {
+                Some(written) => self.stripe.extend_from_slice(written),
+                None => self.stripe.resize(rows * self.row_bytes, self.fill)
+            }
+            self.hand_over_stripe(rows);
+        }
     }
 }
 

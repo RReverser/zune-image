@@ -28,6 +28,7 @@ use crate::headers::{
 use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
+use crate::mcu::{RowSink, Stripes};
 use crate::misc::SOFMarkers;
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
@@ -897,6 +898,58 @@ where
             Ok(())
         } else {
             self.decode_mcu_ycbcr_baseline_with(out, &mut on_rows)
+        }
+    }
+
+    /// Decode the image one stripe of rows at a time, and hand over each stripe as soon as its
+    /// pixels are final, without an output buffer for the whole image.
+    ///
+    /// `on_rows` is called with the range of output rows that a stripe covers and the buffer
+    /// that holds exactly the bytes of those rows, in the order of the rows, until every row of
+    /// the image has been handed over once. The pixels are those that
+    /// [`decode_into`](Self::decode_into) writes into a buffer of zeros. The decoder writes the
+    /// next stripe into the same buffer, so `on_rows` reads the rows before it returns, or takes
+    /// the buffer and leaves another one, or an empty one, in its place.
+    ///
+    /// A sequential image writes a stripe for each row of MCUs, which is 8 or 16 rows of the
+    /// image, so the decoder holds one row of MCUs of output at a time. A progressive image, or a
+    /// sequential one whose components are in separate scans, is complete only after the last
+    /// scan: the decoder writes it into a buffer for the whole image and hands that over in
+    /// stripes once it is complete. The rows that a corrupt image does not reach are handed over
+    /// at the end.
+    ///
+    /// On an error, the rows handed over so far are final and the others are not handed over.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use zune_core::bytestream::ZCursor;
+    /// use zune_jpeg::JpegDecoder;
+    /// let mut decoder = JpegDecoder::new(ZCursor::new(&[]));
+    /// let mut sum = 0_u64;
+    /// decoder
+    ///     .decode_stripes_with(|_rows, stripe| {
+    ///         sum += stripe.iter().map(|&pixel| u64::from(pixel)).sum::<u64>()
+    ///     })
+    ///     .unwrap();
+    /// ```
+    pub fn decode_stripes_with(
+        &mut self, mut on_rows: impl FnMut(core::ops::Range<usize>, &mut Vec<u8>)
+    ) -> Result<(), DecodeErrors> {
+        self.decode_headers_internal()?;
+
+        let height = usize::from(self.info.height);
+        let row_bytes =
+            usize::from(self.info.width) * self.options.jpeg_get_out_colorspace().num_components();
+        let mut stripes = Stripes::new(height, row_bytes, &mut on_rows);
+
+        if self.is_progressive {
+            stripes.set_mcu_row_rows(8 * self.v_max);
+            self.decode_mcu_ycbcr_progressive(stripes.rest())?;
+            stripes.hand_over_rest();
+            Ok(())
+        } else {
+            self.decode_mcu_ycbcr_baseline_into(&mut stripes)
         }
     }
 
